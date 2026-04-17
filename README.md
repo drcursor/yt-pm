@@ -30,25 +30,6 @@ All destructive actions show a full per-video plan and require explicit confirma
 
 If your session expires mid-operation the app will pause and ask you to refresh your cookies before continuing.
 
-## Download
-
-Pre-built binaries for macOS, Linux, and Windows are on the [Releases](https://github.com/eduardobalsa/yt-pm/releases) page.
-
-| Platform | Binary |
-|----------|--------|
-| macOS (Apple Silicon) | `yt-pm-darwin-arm64` |
-| macOS (Intel) | `yt-pm-darwin-amd64` |
-| Linux (x86_64) | `yt-pm-linux-amd64` |
-| Linux (ARM64) | `yt-pm-linux-arm64` |
-| Windows (x86_64) | `yt-pm-windows-amd64.exe` |
-
-Download the binary for your platform, make it executable, and run it:
-
-```bash
-chmod +x yt-pm-darwin-arm64
-./yt-pm-darwin-arm64
-```
-
 ## Installation
 
 Requires Go 1.21+.
