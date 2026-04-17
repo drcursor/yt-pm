@@ -78,16 +78,6 @@ type sourceVideosLoadedMsg struct {
 }
 type destVideosLoadedMsg struct{ videos []youtube.Video } // dest skipped count not needed
 type videosLoadErrMsg struct{ err error }
-type videoOpMsg struct {
-	current    int
-	total      int
-	videoTitle string
-	failed     int
-	done       bool
-	successes  int
-	failures   int
-}
-type sessionExpiredMsg struct{} // auth error mid-operation — triggers re-auth flow
 type playlistDeletedMsg struct{ playlistID string }
 type playlistDeleteErrMsg struct{ err error }
 type brokenVideosLoadedMsg struct {
@@ -146,6 +136,9 @@ type appModel struct {
 
 	// video-level operation: non-nil when copy/move is initiated from the video list
 	selectedVideos []youtube.Video
+
+	// batch operation state (non-nil while a mutating operation is in flight)
+	batchState *batchOpState
 }
 
 type retryTarget int
@@ -355,7 +348,6 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ui.BrokenVideosRemoveMsg:
-		// Reuse the clear operation infrastructure: set source + videos and run.
 		m.source = msg.Playlist
 		m.action = "clear"
 		m.allVideos = make([]youtube.Video, len(msg.Videos))
@@ -366,16 +358,10 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.videos = msg.Videos
-		opState = &videoOpState{
-			action: "clear",
-			videos: m.allVideos,
-			source: m.source,
-			client: m.ytClient,
-			logger: m.logger,
-		}
+		m.batchState = newBatchOpState("clear", m.allVideos, m.source, ui.Playlist{}, m.ytClient, m.logger)
 		m.progress = ui.NewProgressModel(len(m.allVideos))
 		m.screen = screenProgress
-		return m, tea.Batch(m.progress.Init(), opState.next())
+		return m, tea.Batch(m.progress.Init(), m.batchState.launchNextBatch())
 
 	// ── Stats ────────────────────────────────────────────────────────────────
 	case ui.PlaylistStatsMsg:
@@ -521,32 +507,10 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.allVideos = filtered
 			m.videos = toUIVideos(filtered)
 		}
-		m.progress = ui.NewProgressModel(len(m.videos))
-		m.screen = screenProgress
-		return m, tea.Batch(m.progress.Init(), m.runOperation())
-
 	case ui.PlanCancelledMsg:
 		m.screen = screenPlaylistList
 		m.authRetried = false
 		return m, nil
-
-	// ── Progress update ──────────────────────────────────────────────────────
-	case videoOpMsg:
-		if msg.done {
-			m.result = ui.NewResultModel(msg.successes, msg.failures, m.logPath)
-			m.screen = screenResult
-			return m, m.result.Init()
-		}
-		var cmd tea.Cmd
-		upd, c := m.progress.Update(ui.ProgressUpdateMsg{
-			Current:    msg.current,
-			Total:      msg.total,
-			VideoTitle: msg.videoTitle,
-			Failed:     msg.failed,
-		})
-		m.progress = upd.(ui.ProgressModel)
-		cmd = c
-		return m, cmd
 
 	case exportDoneMsg:
 		m.result = ui.NewResultModel(len(m.videos), 0, m.logPath)
@@ -767,170 +731,128 @@ func (m appModel) loadSessionFromMsg(msg ui.OnboardingDoneMsg) (youtube.Session,
 	return session, err
 }
 
-func (m appModel) runOperation() tea.Cmd {
-	return func() tea.Msg {
-		videos := m.allVideos
-		total := len(videos)
-		successes, failures := 0, 0
 
-		switch m.action {
-		case "export":
-			return m.exportVideos(videos, exportDefaultFilename(m.source.Title))
+// ── Batch operations ──────────────────────────────────────────────────────────
+//
+// All mutating operations (copy, move, clear, remove) use batched API calls:
+// multiple videos per request instead of one. YouTube serialises mutations per
+// playlist server-side, so concurrent single-video requests are mostly rejected.
+// Batching sidesteps this and reduces total request count.
+//
+// batchSize controls how many videos are bundled per API call. The YouTube
+// internal API has no published limit; values up to ~50 are known to work.
 
-		case "copy":
-			for i, v := range videos {
-				_, err := m.ytClient.AddVideo(m.target.ID, v.ID)
-				if err != nil {
-					m.logger.Printf("WARN copy failed for video %q (%s): %v", v.Title, v.ID, err)
-					failures++
-				} else {
-					successes++
-				}
-				_ = sendProgress(i+1, total, v.Title, failures) // progress is fire-and-forget here; see note below
-			}
+const batchSize = 25
 
-		case "move":
-			for i, v := range videos {
-				_, err := m.ytClient.AddVideo(m.target.ID, v.ID)
-				if err != nil {
-					m.logger.Printf("WARN move/add failed for video %q (%s): %v — skipping remove", v.Title, v.ID, err)
-					failures++
-					_ = sendProgress(i+1, total, v.Title, failures)
-					continue
-				}
-				// Only remove from source if add succeeded.
-				// Must use v.SetVideoID (source entry ID), not result.SetVideoID
-				// which is the target entry and would cause a 400.
-				if err := m.ytClient.RemoveVideo(m.source.ID, v.SetVideoID); err != nil {
-					// SAFETY WARNING: video now exists in BOTH source and target playlists — manual cleanup required.
-					m.logger.Printf("WARN move/remove failed for video %q (%s): %v — VIDEO EXISTS IN BOTH PLAYLISTS, manual cleanup required", v.Title, v.ID, err)
-					failures++
-				} else {
-					successes++
-				}
-				_ = sendProgress(i+1, total, v.Title, failures)
-			}
-
-		case "clear", "remove":
-			for i, v := range videos {
-				// IRREVERSIBLE: removal from YouTube playlist cannot be undone by this app.
-				if err := m.ytClient.RemoveVideo(m.source.ID, v.SetVideoID); err != nil {
-					m.logger.Printf("WARN clear failed for video %q (%s): %v", v.Title, v.ID, err)
-					failures++
-				} else {
-					successes++
-				}
-				_ = sendProgress(i+1, total, v.Title, failures)
-			}
-		}
-
-		return videoOpMsg{done: true, successes: successes, failures: failures}
-	}
+// batchResultMsg is returned after each batch API call.
+type batchResultMsg struct {
+	count     int    // number of videos in this batch
+	lastName  string // title of last video in batch (shown in progress bar)
+	failed    int    // 0 on success, count on failure (batch is atomic)
+	authError bool
 }
 
-// sendProgress is a no-op placeholder — in the long operation goroutine we
-// return a single done message because bubbletea commands return one Msg.
-// Progress updates are delivered by splitting the operation into per-video
-// commands chained via batchNextVideo.
-func sendProgress(_, _ int, _ string, _ int) error { return nil }
-
-// ── Per-video chained commands ────────────────────────────────────────────────
-// We override runOperation with a chained approach for real progress feedback.
-// Each step processes one video and returns a videoOpMsg, then the Update loop
-// chains the next step.
-
-type videoOpState struct {
+// batchOpState sequences batched mutations for all mutating operations.
+// All fields are touched only from the bubbletea Update goroutine.
+type batchOpState struct {
 	action    string
 	videos    []youtube.Video
-	index     int
-	successes int
-	failures  int
 	source    ui.Playlist
 	target    ui.Playlist
 	client    *youtube.Client
 	logger    *log.Logger
+	nextIdx   int
+	processed int
+	failed    int
 }
 
-func (s *videoOpState) next() tea.Cmd {
-	if s.index >= len(s.videos) {
-		return func() tea.Msg {
-			return videoOpMsg{done: true, successes: s.successes, failures: s.failures}
-		}
+func newBatchOpState(action string, videos []youtube.Video, source, target ui.Playlist, client *youtube.Client, logger *log.Logger) *batchOpState {
+	return &batchOpState{
+		action: action, videos: videos,
+		source: source, target: target,
+		client: client, logger: logger,
 	}
-	v := s.videos[s.index]
-	idx := s.index
-	total := len(s.videos)
-	s.index++
-	snap := *s // capture by value for the closure
+}
+
+// launchNextBatch dispatches the next batchSize videos as a single API call.
+// Must only be called when nextIdx < len(videos).
+func (s *batchOpState) launchNextBatch() tea.Cmd {
+	end := s.nextIdx + batchSize
+	if end > len(s.videos) {
+		end = len(s.videos)
+	}
+	batch := s.videos[s.nextIdx:end]
+	s.nextIdx = end
+
+	lastName := batch[len(batch)-1].Title
+	count := len(batch)
+	action := s.action
+	source := s.source
+	target := s.target
+	client := s.client
+	logger := s.logger
 
 	return func() tea.Msg {
-		switch snap.action {
+		switch action {
 		case "copy":
-			_, err := snap.client.AddVideo(snap.target.ID, v.ID)
-			if err != nil {
+			if err := client.AddVideos(target.ID, batch); err != nil {
 				var authErr *youtube.AuthError
 				if errors.As(err, &authErr) {
-					return sessionExpiredMsg{}
+					return batchResultMsg{count: count, lastName: lastName, failed: count, authError: true}
 				}
-				snap.logger.Printf("WARN copy failed for video %q (%s): %v", v.Title, v.ID, err)
-				snap.failures++
-			} else {
-				snap.successes++
+				for _, v := range batch {
+					logger.Printf("WARN copy failed for video %q (%s): %v", v.Title, v.ID, err)
+				}
+				return batchResultMsg{count: count, lastName: lastName, failed: count}
 			}
+			return batchResultMsg{count: count, lastName: lastName}
 
 		case "move":
-			_, err := snap.client.AddVideo(snap.target.ID, v.ID)
-			if err != nil {
+			if err := client.AddVideos(target.ID, batch); err != nil {
 				var authErr *youtube.AuthError
 				if errors.As(err, &authErr) {
-					return sessionExpiredMsg{}
+					return batchResultMsg{count: count, lastName: lastName, failed: count, authError: true}
 				}
-				snap.logger.Printf("WARN move/add failed for video %q (%s): %v — skipping remove", v.Title, v.ID, err)
-				snap.failures++
-			} else {
-				// IRREVERSIBLE: removal from YouTube playlist cannot be undone by this app.
-				// Must use v.SetVideoID (source entry ID), not result.SetVideoID
-				// which is the target entry and would cause a 400.
-				if err := snap.client.RemoveVideo(snap.source.ID, v.SetVideoID); err != nil {
-					var authErr *youtube.AuthError
-					if errors.As(err, &authErr) {
-						// Add succeeded but remove failed due to auth. Video exists in both playlists.
-						snap.logger.Printf("WARN session expired on remove for video %q — VIDEO EXISTS IN BOTH PLAYLISTS, manual cleanup may be required", v.Title)
-						return sessionExpiredMsg{}
-					}
-					// SAFETY WARNING: video now exists in BOTH source and target playlists — manual cleanup required.
-					snap.logger.Printf("WARN move/remove failed for video %q (%s): %v — VIDEO EXISTS IN BOTH PLAYLISTS, manual cleanup required", v.Title, v.ID, err)
-					snap.failures++
-				} else {
-					snap.successes++
+				for _, v := range batch {
+					logger.Printf("WARN move/add failed for video %q (%s): %v — skipping remove", v.Title, v.ID, err)
 				}
+				return batchResultMsg{count: count, lastName: lastName, failed: count}
 			}
-
-		case "clear", "remove":
 			// IRREVERSIBLE: removal from YouTube playlist cannot be undone by this app.
-			if err := snap.client.RemoveVideo(snap.source.ID, v.SetVideoID); err != nil {
+			if err := client.RemoveVideos(source.ID, batch); err != nil {
 				var authErr *youtube.AuthError
 				if errors.As(err, &authErr) {
-					return sessionExpiredMsg{}
+					// Add succeeded but remove failed — videos are in both playlists.
+					for _, v := range batch {
+						logger.Printf("WARN session expired on remove for video %q — VIDEO EXISTS IN BOTH PLAYLISTS, manual cleanup may be required", v.Title)
+					}
+					return batchResultMsg{count: count, lastName: lastName, failed: count, authError: true}
 				}
-				snap.logger.Printf("WARN clear failed for video %q (%s): %v", v.Title, v.ID, err)
-				snap.failures++
-			} else {
-				snap.successes++
+				// SAFETY WARNING: videos now exist in BOTH playlists — manual cleanup required.
+				for _, v := range batch {
+					logger.Printf("WARN move/remove failed for video %q (%s): %v — VIDEO EXISTS IN BOTH PLAYLISTS, manual cleanup required", v.Title, v.ID, err)
+				}
+				return batchResultMsg{count: count, lastName: lastName, failed: count}
 			}
-		}
+			return batchResultMsg{count: count, lastName: lastName}
 
-		return videoOpMsg{
-			current:    idx + 1,
-			total:      total,
-			videoTitle: v.Title,
-			failed:     snap.failures,
+		default: // "clear", "remove"
+			// IRREVERSIBLE: removal from YouTube playlist cannot be undone by this app.
+			if err := client.RemoveVideos(source.ID, batch); err != nil {
+				var authErr *youtube.AuthError
+				if errors.As(err, &authErr) {
+					return batchResultMsg{count: count, lastName: lastName, failed: count, authError: true}
+				}
+				for _, v := range batch {
+					logger.Printf("WARN clear failed for video %q (%s): %v", v.Title, v.ID, err)
+				}
+				return batchResultMsg{count: count, lastName: lastName, failed: count}
+			}
+			return batchResultMsg{count: count, lastName: lastName}
 		}
 	}
 }
 
-// opState is stored on appModel for chained progress.
-var opState *videoOpState
 
 func exportDefaultFilename(playlistTitle string) string {
 	safe := strings.Map(func(r rune) rune {
@@ -1005,8 +927,8 @@ func (m appModel) updateWithChain(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			newClient := youtube.NewClient(session, m.logger)
 			m.ytClient = newClient
-			if opState != nil {
-				opState.client = newClient
+			if m.batchState != nil {
+				m.batchState.client = newClient
 			}
 			m.reAuthMode = false
 			m.authRetried = false
@@ -1022,20 +944,13 @@ func (m appModel) updateWithChain(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.retryVideoLoad()
 			default: // mid-operation resume
 				m.screen = screenProgress
-				if opState != nil {
-					return m, opState.next()
+				if m.batchState != nil {
+					return m, m.batchState.launchNextBatch()
 				}
 			}
 			return m, nil
 		}
 		return m.Update(msg)
-
-	case sessionExpiredMsg:
-		m.logger.Printf("WARN session expired mid-operation — pausing for re-auth")
-		if opState != nil {
-			opState.index-- // retry the video that triggered the auth error
-		}
-		return m.startReAuth()
 
 	case ui.PlanConfirmedMsg:
 		if m.action == "export" {
@@ -1066,42 +981,50 @@ func (m appModel) updateWithChain(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logger.Printf("skip-duplicates: %d videos filtered out, %d will be processed", len(videos)-len(filtered), len(filtered))
 			videos = filtered
 		}
-		// Set up chained operation state.
-		opState = &videoOpState{
-			action: m.action,
-			videos: videos,
-			source: m.source,
-			target: m.target,
-			client: m.ytClient,
-			logger: m.logger,
-		}
-		m.progress = ui.NewProgressModel(len(videos))
-		m.screen = screenProgress
-		return m, tea.Batch(m.progress.Init(), opState.next())
-
-	case videoOpMsg:
-		if msg.done {
-			m.result = ui.NewResultModel(msg.successes, msg.failures, m.logPath)
+		// All mutating operations use the batch path.
+		if len(videos) == 0 {
+			m.result = ui.NewResultModel(0, 0, m.logPath)
 			m.screen = screenResult
 			return m, m.result.Init()
 		}
-		// Forward progress to UI.
-		upd, c := m.progress.Update(ui.ProgressUpdateMsg{
-			Current:    msg.current,
-			Total:      msg.total,
-			VideoTitle: msg.videoTitle,
-			Failed:     msg.failed,
+		m.batchState = newBatchOpState(m.action, videos, m.source, m.target, m.ytClient, m.logger)
+		m.progress = ui.NewProgressModel(len(videos))
+		m.screen = screenProgress
+		return m, tea.Batch(m.progress.Init(), m.batchState.launchNextBatch())
+
+	case batchResultMsg:
+		bs := m.batchState
+		if bs == nil {
+			return m, nil
+		}
+		if msg.authError {
+			m.logger.Printf("WARN session expired mid-operation — pausing for re-auth")
+			bs.nextIdx -= msg.count // step back so this batch is retried after re-auth
+			return m.startReAuth()
+		}
+		bs.processed += msg.count
+		bs.failed += msg.failed
+
+		upd, uiCmd := m.progress.Update(ui.ProgressUpdateMsg{
+			Current:    bs.processed,
+			Total:      len(bs.videos),
+			VideoTitle: msg.lastName,
+			Failed:     bs.failed,
 		})
 		m.progress = upd.(ui.ProgressModel)
-		// Update shared state counters and chain next video.
-		if opState != nil {
-			if msg.failed > opState.failures {
-				opState.failures = msg.failed
-			}
-			opState.successes = msg.current - msg.failed
-			return m, tea.Batch(c, opState.next())
+
+		if bs.nextIdx < len(bs.videos) {
+			return m, tea.Batch(uiCmd, bs.launchNextBatch())
 		}
-		return m, c
+
+		successes := bs.processed - bs.failed
+		if successes < 0 {
+			successes = 0
+		}
+		m.batchState = nil
+		m.result = ui.NewResultModel(successes, bs.failed, m.logPath)
+		m.screen = screenResult
+		return m, tea.Batch(uiCmd, m.result.Init())
 	}
 
 	return m.Update(msg)

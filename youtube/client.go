@@ -199,6 +199,59 @@ func (c *Client) RemoveVideo(playlistID, setVideoID string) error {
 	return parseRemoveVideoResponse(resp)
 }
 
+// AddVideos adds multiple videos to a playlist in a single API call.
+// This is more efficient than calling AddVideo repeatedly.
+func (c *Client) AddVideos(playlistID string, videos []Video) error {
+	c.logger.Printf("[youtube] AddVideos: playlistID=%s count=%d", playlistID, len(videos))
+
+	actions := make([]map[string]string, len(videos))
+	for i, v := range videos {
+		actions[i] = map[string]string{
+			"action":       "ACTION_ADD_VIDEO",
+			"addedVideoId": v.ID,
+		}
+	}
+
+	body := c.baseContext()
+	body["playlistId"] = playlistID
+	body["actions"] = actions
+
+	resp, err := c.post("browse/edit_playlist", body)
+	if err != nil {
+		return err
+	}
+	return parseRemoveVideoResponse(resp) // same status-check shape
+}
+
+// RemoveVideos removes multiple playlist entries in a single API call.
+// This is more efficient than calling RemoveVideo repeatedly and avoids
+// concurrent-mutation rejections from YouTube's playlist edit endpoint.
+//
+// IRREVERSIBLE: removal from YouTube playlist cannot be undone by this app.
+func (c *Client) RemoveVideos(playlistID string, videos []Video) error {
+	// IRREVERSIBLE: removal from YouTube playlist cannot be undone by this app.
+	c.logger.Printf("[youtube] RemoveVideos: playlistID=%s count=%d", playlistID, len(videos))
+
+	actions := make([]map[string]string, len(videos))
+	for i, v := range videos {
+		actions[i] = map[string]string{
+			"action":         "ACTION_REMOVE_VIDEO",
+			"setVideoId":     v.SetVideoID,
+			"removedVideoId": v.ID,
+		}
+	}
+
+	body := c.baseContext()
+	body["playlistId"] = playlistID
+	body["actions"] = actions
+
+	resp, err := c.post("browse/edit_playlist", body)
+	if err != nil {
+		return err
+	}
+	return parseRemoveVideoResponse(resp)
+}
+
 // FetchVisitorData fetches the YouTube home page to obtain the visitorData
 // (X-Goog-Visitor-Id) required for API headers.  The result is stored on the
 // session embedded in the client.

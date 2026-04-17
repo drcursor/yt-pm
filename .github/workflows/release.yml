@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.26.2'
+
+      - name: Build binaries
+        run: |
+          GOOS=darwin  GOARCH=arm64 go build -ldflags="-s -w" -o yt-pm-darwin-arm64  .
+          GOOS=darwin  GOARCH=amd64 go build -ldflags="-s -w" -o yt-pm-darwin-amd64  .
+          GOOS=linux   GOARCH=amd64 go build -ldflags="-s -w" -o yt-pm-linux-amd64   .
+          GOOS=linux   GOARCH=arm64 go build -ldflags="-s -w" -o yt-pm-linux-arm64   .
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o yt-pm-windows-amd64.exe .
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            yt-pm-darwin-arm64
+            yt-pm-darwin-amd64
+            yt-pm-linux-amd64
+            yt-pm-linux-arm64
+            yt-pm-windows-amd64.exe
